@@ -76,7 +76,7 @@ public class ElasticsearchConnectorModule
 
     // xlakehouse
     protected void bindTophantConfig(Binder binder) {
-        String configFilePath = "/opt/trino/xlakehouse-trino-config/xlakehouse-trino-config.properties";
+        String configFilePath = "/opt/trino/config/xlakehouse-trino-config.properties";
 
         Properties properties = new Properties();
         try (FileInputStream input = new FileInputStream(configFilePath)) {
