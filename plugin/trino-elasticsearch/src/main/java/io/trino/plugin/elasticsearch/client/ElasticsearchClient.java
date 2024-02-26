@@ -13,6 +13,11 @@
  */
 package io.trino.plugin.elasticsearch.client;
 
+import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.exceptions.ExceptionUtil;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.http.HttpUtil;
+import cn.hutool.json.JSONUtil;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicAWSCredentials;
@@ -23,16 +28,20 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.inject.Inject;
+import com.google.inject.name.Named;
 import io.airlift.json.JsonCodec;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
 import io.airlift.stats.TimeStat;
 import io.airlift.units.Duration;
+import io.trino.cache.EvictableCacheBuilder;
 import io.trino.plugin.elasticsearch.AwsSecurityConfig;
 import io.trino.plugin.elasticsearch.ElasticsearchConfig;
 import io.trino.plugin.elasticsearch.PasswordConfig;
@@ -73,14 +82,9 @@ import javax.net.ssl.SSLContext;
 import java.io.File;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.OptionalLong;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -132,12 +136,22 @@ public class ElasticsearchClient
     private final TimeStat countStats = new TimeStat(MILLISECONDS);
     private final TimeStat backpressureStats = new TimeStat(MILLISECONDS);
 
+
+    // xlakehouse
+    private List<String> hosts;
+    private String lakehouseApiEsMetaConfigUrl;
+
     @Inject
     public ElasticsearchClient(
+            @Named("lakehouseApiEsMetaConfigUrl") String lakehouseApiEsMetaConfigUrl,
             ElasticsearchConfig config,
             Optional<AwsSecurityConfig> awsSecurityConfig,
             Optional<PasswordConfig> passwordConfig)
     {
+        // xlakehouse
+        this.hosts = config.getHosts();
+        this.lakehouseApiEsMetaConfigUrl = lakehouseApiEsMetaConfigUrl;
+
         client = createClient(config, awsSecurityConfig, passwordConfig, backpressureStats);
 
         this.ignorePublishAddress = config.isIgnorePublishAddress();
@@ -460,6 +474,12 @@ public class ElasticsearchClient
                 if (metaProperties.isNull()) {
                     metaProperties = nullSafeNode(metaNode, "presto");
                 }
+
+
+                // xlakehouse
+                // 请求xlakehouse-api的结果,查询是否有特殊设置
+                // 返回结构参考: https://trino.io/docs/current/connector/elasticsearch.html#array-types
+                metaProperties = metaFromLakehouse(index);
 
                 return new IndexMetadata(parseType(mappings.get("properties"), metaProperties));
             }
@@ -790,5 +810,105 @@ public class ElasticsearchClient
     private interface ResponseHandler<T>
     {
         T process(String body);
+    }
+
+
+
+    // --------------------------------------------------------------------------------------------
+    // xlakehouse
+    // --------------------------------------------------------------------------------------------
+
+    public static class EsMetaConfigParamDto {
+        private List<String> hosts;
+        private String index;
+
+        public EsMetaConfigParamDto(List<String> hosts, String index) {
+            this.hosts = hosts;
+            this.index = index;
+        }
+
+        public List<String> getHosts() {
+            return hosts;
+        }
+
+        public void setHosts(List<String> hosts) {
+            this.hosts = hosts;
+        }
+
+        public String getIndex() {
+            return index;
+        }
+
+        public void setIndex(String index) {
+            this.index = index;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            EsMetaConfigParamDto paramDto = (EsMetaConfigParamDto) o;
+
+            if (!CollUtil.isEqualList(hosts,paramDto.hosts)) {
+                return false;
+            }
+            return Objects.equals(index, paramDto.index);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = hosts != null ? hosts.hashCode() : 0;
+            result = 31 * result + (index != null ? index.hashCode() : 0);
+            return result;
+        }
+
+    }
+
+
+    // 使用缓存,避免同一个index短时间多次请求lakehouse-api
+    LoadingCache<EsMetaConfigParamDto, JsonNode> metaCache = EvictableCacheBuilder.newBuilder()
+            .concurrencyLevel(8)
+            .maximumSize(1000)
+            // 10秒过期
+            .expireAfterWrite(10, TimeUnit.SECONDS)
+            .build(new CacheLoader<>() {
+                @Override
+                public JsonNode load(EsMetaConfigParamDto key) throws Exception {
+                    return loadMetaFromLakehouse(key);
+                }
+            });
+
+
+    private JsonNode loadMetaFromLakehouse(EsMetaConfigParamDto paramDto) {
+        try {
+            if (StrUtil.isEmpty(lakehouseApiEsMetaConfigUrl)) {
+                LOG.warn("lakehouseApiEsMetaConfigUrl 配置错误,url不可为空!");
+                return OBJECT_MAPPER.createObjectNode();
+            }
+
+            String bodyJson = JSONUtil.toJsonStr(paramDto);
+            LOG.info(StrUtil.format("请求: lakehouseApiEsMetaConfigUrl: {} , body: {}", lakehouseApiEsMetaConfigUrl, bodyJson));
+
+            String resp = HttpUtil.post(lakehouseApiEsMetaConfigUrl, bodyJson, 3000);
+            JsonNode respJsonNode = OBJECT_MAPPER.readTree(resp);
+            if (respJsonNode.get("code").asInt() != 20000) {
+                return OBJECT_MAPPER.createObjectNode();
+            }
+            return respJsonNode.get("data");
+        } catch (Exception e) {
+            LOG.info(ExceptionUtil.stacktraceToString(e));
+        }
+        return OBJECT_MAPPER.createObjectNode();
+    }
+
+    private JsonNode metaFromLakehouse(String index) {
+        EsMetaConfigParamDto paramDto = new EsMetaConfigParamDto(hosts, index);
+        try {
+            return metaCache.get(paramDto);
+        } catch (Exception e) {
+            LOG.info(ExceptionUtil.stacktraceToString(e));
+            return OBJECT_MAPPER.createObjectNode();
+        }
     }
 }

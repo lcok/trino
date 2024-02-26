@@ -15,10 +15,14 @@ package io.trino.plugin.elasticsearch;
 
 import com.google.inject.Binder;
 import com.google.inject.Scopes;
+import com.google.inject.name.Names;
 import io.airlift.configuration.AbstractConfigurationAwareModule;
 import io.trino.plugin.elasticsearch.client.ElasticsearchClient;
 import io.trino.plugin.elasticsearch.ptf.RawQuery;
 import io.trino.spi.function.table.ConnectorTableFunction;
+
+import java.io.FileInputStream;
+import java.util.Properties;
 
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
@@ -46,6 +50,9 @@ public class ElasticsearchConnectorModule
 
         configBinder(binder).bindConfig(ElasticsearchConfig.class);
 
+        // xlakehouse
+        bindTophantConfig(binder);
+
         newOptionalBinder(binder, AwsSecurityConfig.class);
         newOptionalBinder(binder, PasswordConfig.class);
 
@@ -65,4 +72,23 @@ public class ElasticsearchConnectorModule
                         .isPresent(),
                 conditionalBinder -> configBinder(conditionalBinder).bindConfig(PasswordConfig.class)));
     }
+
+
+    // xlakehouse
+    protected void bindTophantConfig(Binder binder) {
+        String configFilePath = "/opt/trino/xlakehouse-trino-config/xlakehouse-trino-config.properties";
+
+        Properties properties = new Properties();
+        try (FileInputStream input = new FileInputStream(configFilePath)) {
+            properties.load(input);
+            // Bind properties using Names.named
+            Names.bindProperties(binder, properties);
+        } catch (Exception e) {
+            System.out.println("----->>>> 未能读取到配置: "+configFilePath);
+            e.printStackTrace();
+            throw new RuntimeException("----->>>> 未能读取到配置: "+configFilePath);
+        }
+
+    }
+
 }
